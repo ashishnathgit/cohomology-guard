@@ -80,6 +80,8 @@ pub struct NodeStalk {
     pub reading: DVector<f64>,
     /// Stalk dimension (2 for homogeneous scalar readings).
     pub dim: usize,
+    /// Whether a simulated hardware/spoofing fault is currently injected.
+    pub is_faulty: bool,
 }
 
 impl NodeStalk {
@@ -89,6 +91,7 @@ impl NodeStalk {
             sensor_type,
             reading: DVector::from_vec(vec![raw, 1.0]),
             dim: 2,
+            is_faulty: false,
         }
     }
 
@@ -270,6 +273,55 @@ impl CellularSheaf {
             .ok_or(SheafError::UnknownNode(n.index()))?
             .set_raw(raw);
         Ok(())
+    }
+
+    pub fn set_faulty(&mut self, n: NodeIndex, faulty: bool) -> Result<(), SheafError> {
+        self.graph
+            .node_weight_mut(n)
+            .ok_or(SheafError::UnknownNode(n.index()))?
+            .is_faulty = faulty;
+        Ok(())
+    }
+
+    /// Build the canonical 6-sensor demo network: a directed ring
+    /// `0 -> 1 -> ... -> 5 -> 0` of mixed Celsius/Fahrenheit/Kelvin sensors,
+    /// plus two chords (0 -> 3 and 1 -> 4) so independent loops exist and
+    /// `H^1` obstructions can be non-trivial. All sensors start consistent,
+    /// observing the same `initial_celsius` zone temperature.
+    pub fn demo_network(initial_celsius: f64) -> (Self, Vec<NodeIndex>) {
+        const TYPES: [SensorType; 6] = [
+            SensorType::Celsius,
+            SensorType::Fahrenheit,
+            SensorType::Kelvin,
+            SensorType::Celsius,
+            SensorType::Fahrenheit,
+            SensorType::Kelvin,
+        ];
+        let mut sheaf = Self::new();
+        let nodes: Vec<NodeIndex> = TYPES
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                sheaf.add_sensor(NodeStalk::new(
+                    format!("S{i}-{}", t.unit()),
+                    t,
+                    t.from_celsius(initial_celsius),
+                ))
+            })
+            .collect();
+        let n = nodes.len();
+        for i in 0..n {
+            sheaf
+                .connect(nodes[i], nodes[(i + 1) % n])
+                .expect("ring edge dimensions are valid");
+        }
+        sheaf
+            .connect(nodes[0], nodes[3])
+            .expect("chord edge dimensions are valid");
+        sheaf
+            .connect(nodes[1], nodes[4])
+            .expect("chord edge dimensions are valid");
+        (sheaf, nodes)
     }
 
     /// Starting row/column offset of each node block in `C⁰`.

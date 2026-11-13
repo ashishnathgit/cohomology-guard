@@ -1,135 +1,163 @@
 //! cohomology-guard: real-time sensor anomaly detection with cellular sheaves.
+//!
+//! Interactive ratatui terminal dashboard. Six temperature sensors (mixed
+//! Celsius/Fahrenheit/Kelvin) form a cellular sheaf over a ring+chords graph.
+//! Each tick, synthetic Gaussian-noised telemetry is pushed through the
+//! sheaf, the coboundary/Laplacian machinery computes the Dirichlet energy
+//! and per-node suspicion scores, and the dashboard renders live.
 
 mod sheaf;
-mod simulator;
+mod ui;
 
-use colored::Colorize;
-use sheaf::{CellularSheaf, ConsistencyReport};
-use simulator::{SimConfig, TelemetryFrame};
+use std::io;
+use std::panic;
+use std::time::{Duration, Instant};
 
-/// Dirichlet energy (°C²) above which the network is declared obstructed.
-const ENERGY_THRESHOLD: f64 = 0.05;
-/// Edge residual (°C) above which an edge is highlighted.
-const EDGE_THRESHOLD: f64 = 0.15;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use petgraph::graph::NodeIndex;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
-#[tokio::main]
-async fn main() {
-    let config = SimConfig::default();
-    let mut sheaf = simulator::build_ring_network(config.base_celsius);
-    print_banner(&sheaf);
+use sheaf::CellularSheaf;
+use ui::DashboardState;
 
-    let nodes: Vec<_> = sheaf.graph.node_indices().collect();
-    let mut rx = simulator::spawn_telemetry(config);
-    let mut alarms = 0u32;
+/// Zone ambient temperature that healthy sensors fluctuate around.
+const BASE_CELSIUS: f64 = 22.5;
+/// Peak-to-peak Gaussian-ish measurement noise bound, in °C.
+const NOISE_CELSIUS: f64 = 0.06;
+/// Offset injected on a spoofed/faulty sensor, in °C.
+const FAULT_OFFSET_CELSIUS: f64 = 45.0;
+/// Dashboard tick interval.
+const TICK_RATE: Duration = Duration::from_millis(250);
 
-    while let Some(frame) = rx.recv().await {
-        for (node, raw) in nodes.iter().zip(&frame.raw_readings) {
-            sheaf
-                .set_raw_reading(*node, *raw)
-                .expect("node indices come from the same graph");
-        }
-        let report = sheaf.evaluate_consistency();
-        if report.is_obstructed(ENERGY_THRESHOLD) {
-            alarms += 1;
-        }
-        print_tick(&sheaf, &frame, &report);
-    }
+fn main() -> io::Result<()> {
+    install_panic_hook();
 
-    println!("{}", "═".repeat(72).bright_black());
-    let summary = format!("Simulation complete: {alarms} obstructed tick(s) detected.");
-    if alarms > 0 {
-        println!("{}", summary.red().bold());
-    } else {
-        println!("{}", summary.green().bold());
-    }
+    let mut terminal = init_terminal()?;
+    let result = run(&mut terminal);
+    restore_terminal()?;
+    result
 }
 
-fn print_banner(sheaf: &CellularSheaf) {
-    let delta = sheaf.compute_coboundary_matrix();
+/// Install a panic hook that restores the terminal before the default panic
+/// handler prints its message, so a panic never leaves the terminal in raw
+/// mode / alternate screen.
+fn install_panic_hook() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        default_hook(info);
+    }));
+}
+
+fn init_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    Terminal::new(CrosstermBackend::new(stdout))
+}
+
+fn restore_terminal() -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// Per-sensor fault state and the base (unfaulted) celsius reading each
+/// sensor would report, so toggling faults on/off is reversible.
+struct SimState {
+    rng: StdRng,
+    fault_active: [bool; 6],
+    tick: u64,
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    let (mut sheaf, nodes) = CellularSheaf::demo_network(BASE_CELSIUS);
+    // Sanity-check the Laplacian is well-formed before entering the loop.
     let laplacian = sheaf.compute_sheaf_laplacian();
-    println!("{}", "═".repeat(72).bright_black());
-    println!("{}", "  COHOMOLOGY GUARD — Sheaf-Laplacian Sensor Anomaly Detector".cyan().bold());
-    println!("{}", "═".repeat(72).bright_black());
-    println!(
-        "  Sensors: {}   Links: {}   δ₀: {}×{}   L_F: {}×{}",
-        sheaf.graph.node_count(),
-        sheaf.graph.edge_count(),
-        delta.nrows(),
-        delta.ncols(),
-        laplacian.nrows(),
-        laplacian.ncols()
-    );
-    for n in sheaf.graph.node_indices() {
-        let s = sheaf.stalk(n);
-        println!("    [{}] {:<8} {:<10} stalk dim {}", n.index(), s.sensor_id, s.sensor_type, s.dim);
+    debug_assert_eq!(laplacian.nrows(), laplacian.ncols());
+    let mut dashboard = DashboardState::new();
+    let mut sim = SimState {
+        rng: StdRng::seed_from_u64(0xC0C0_4011),
+        fault_active: [false; 6],
+        tick: 0,
+    };
+
+    let mut last_tick = Instant::now();
+
+    loop {
+        let timeout = TICK_RATE
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or(Duration::ZERO);
+
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('r') => {
+                            for f in sim.fault_active.iter_mut() {
+                                *f = false;
+                            }
+                            for n in &nodes {
+                                sheaf.set_faulty(*n, false).ok();
+                            }
+                        }
+                        KeyCode::Char(c @ '1'..='6') => {
+                            let idx = (c as u8 - b'1') as usize;
+                            sim.fault_active[idx] = !sim.fault_active[idx];
+                            sheaf.set_faulty(nodes[idx], sim.fault_active[idx]).ok();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if last_tick.elapsed() >= TICK_RATE {
+            tick_telemetry(&mut sheaf, &nodes, &mut sim);
+            last_tick = Instant::now();
+        }
+
+        let report = sheaf.evaluate_consistency();
+        dashboard.push_energy(report.dirichlet_energy);
+
+        terminal.draw(|frame| ui::draw(frame, &sheaf, &report, &dashboard))?;
     }
-    println!("  Energy threshold: {ENERGY_THRESHOLD} °C²   Edge threshold: {EDGE_THRESHOLD} °C");
+
+    Ok(())
 }
 
-fn print_tick(sheaf: &CellularSheaf, frame: &TelemetryFrame, report: &ConsistencyReport) {
-    println!("{}", "─".repeat(72).bright_black());
-    let status = if report.is_obstructed(ENERGY_THRESHOLD) {
-        "OBSTRUCTION (H¹ ≠ 0)".red().bold()
-    } else {
-        "CONSISTENT (global section)".green().bold()
-    };
-    let injected = if frame.fault_active {
-        "  [fault injection active]".yellow().to_string()
-    } else {
-        String::new()
-    };
-    println!(
-        "{}  true zone temp {:.2} °C  {}{}",
-        format!("Tick {:>2}", frame.tick).bold(),
-        frame.true_celsius,
-        status,
-        injected
-    );
+/// Advance synthetic telemetry by one tick: slow shared thermal drift plus
+/// small per-sensor Gaussian-ish noise, with a fixed offset added to any
+/// sensor whose fault flag is set.
+fn tick_telemetry(sheaf: &mut CellularSheaf, nodes: &[NodeIndex], sim: &mut SimState) {
+    sim.tick += 1;
+    let drift = 0.4 * (sim.tick as f64 * 0.1).sin();
+    let true_celsius = BASE_CELSIUS + drift;
+    let half = NOISE_CELSIUS / 2.0;
 
-    // Readings
-    let readings: Vec<String> = sheaf
-        .graph
-        .node_indices()
-        .map(|n| {
-            let s = sheaf.stalk(n);
-            format!("S{}={:.2}{}", n.index(), s.raw(), s.sensor_type.unit())
-        })
-        .collect();
-    println!("  Readings: {}", readings.join("  "));
-
-    // Edge residual table
-    println!("  {:<10} {:>14} {:>14} {:>12}", "Edge", "F_u·x_u (°C)", "F_v·x_v (°C)", "Residual");
-    for r in &report.edge_residuals {
-        let (u, v) = (sheaf.stalk(r.source), sheaf.stalk(r.target));
-        let label = format!("e{}: {}→{}", r.edge.index(), r.source.index(), r.target.index());
-        let res = format!("{:>12.4}", r.residual);
-        let res = if r.residual > EDGE_THRESHOLD { res.red().bold() } else { res.green() };
-        println!("  {:<10} {:>14.4} {:>14.4} {}", label, u.as_celsius(), v.as_celsius(), res);
-    }
-
-    let energy = format!("{:.6}", report.dirichlet_energy);
-    let energy = if report.is_obstructed(ENERGY_THRESHOLD) { energy.red().bold() } else { energy.green() };
-    println!(
-        "  Total Dirichlet Energy ‖δ₀x‖² = {}   (xᵀLx = {:.6})",
-        energy, report.laplacian_quadratic_form
-    );
-
-    match report.suspected_fault(ENERGY_THRESHOLD) {
-        Some(top) => {
-            let s = sheaf.stalk(top.node);
-            let ranking: Vec<String> = report
-                .node_ranking
-                .iter()
-                .take(3)
-                .map(|ns| format!("{}:{:.3}", ns.node.index(), ns.score))
-                .collect();
-            println!(
-                "  Suspected Faulty Node: {}  (incident residual sum {:.4}; top-3 {})",
-                format!("#{} {} [{}]", top.node.index(), s.sensor_id, s.sensor_type).red().bold(),
-                top.score,
-                ranking.join(", ")
-            );
+    for (i, node) in nodes.iter().enumerate() {
+        let noise = gaussian_noise(&mut sim.rng, half);
+        let mut celsius = true_celsius + noise;
+        if sim.fault_active[i] {
+            celsius += FAULT_OFFSET_CELSIUS;
         }
-        None => println!("  Suspected Faulty Node: {}", "none".green()),
+        let sensor_type = sheaf.stalk(*node).sensor_type;
+        let raw = sensor_type.from_celsius(celsius);
+        sheaf.set_raw_reading(*node, raw).expect("node from same graph");
     }
+}
+
+/// Approximate standard-normal noise (sum of uniforms, central-limit-ish),
+/// scaled so the peak-to-peak spread matches `half * 2`.
+fn gaussian_noise(rng: &mut StdRng, half: f64) -> f64 {
+    let sum: f64 = (0..4).map(|_| rng.gen_range(-half..=half)).sum();
+    sum / 2.0
 }
